@@ -1,0 +1,27 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.so
+venv/
+.venv/
+*.egg-info/
+
+# MNIST data (don't commit datasets)
+mnist_data/
+data/raw/
+
+# Model checkpoints
+*.pth
+*.pt
+checkpoints/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+logs/
+EOF
