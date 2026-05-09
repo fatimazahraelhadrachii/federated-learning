@@ -1,0 +1,37 @@
+#!/bin/bash
+# Launches the coordinator and N clients locally in separate Terminal tabs (macOS).
+#
+# Usage:
+#   chmod +x run_local.sh
+#   ./run_local.sh 3          # launch 3 clients
+#   ./run_local.sh 5 non_iid  # launch 5 clients with non-IID data split
+
+NUM_CLIENTS=${1:-3}
+MODE=${2:-iid}
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "Launching coordinator + $NUM_CLIENTS clients (mode: $MODE)"
+echo "Project dir: $PROJECT_DIR"
+
+# Start the coordinator in a new Terminal window
+osascript <<EOF
+tell application "Terminal"
+    do script "cd '$PROJECT_DIR' && source venv/bin/activate && python server/coordinator.py"
+end tell
+EOF
+
+# Give the server a moment to start
+sleep 3
+
+# Launch each client in its own Terminal window
+for i in $(seq 0 $((NUM_CLIENTS - 1))); do
+    osascript <<EOF
+tell application "Terminal"
+    do script "cd '$PROJECT_DIR' && source venv/bin/activate && python client/client.py --client-idx $i --num-clients $NUM_CLIENTS --mode $MODE"
+end tell
+EOF
+    sleep 1
+done
+
+echo "✅ Launched. Check the new Terminal windows."
+echo "💡 To stop: close the Terminal windows or Ctrl+C in each."

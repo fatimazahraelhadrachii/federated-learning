@@ -15,6 +15,14 @@ from torchvision import datasets, transforms
 
 def load_mnist(data_dir="./mnist_data"):
     """Download MNIST once, reused by all clients."""
+    import ssl
+    # Bypass SSL verification on Mac (common issue with Python's bundled certs)
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+    # Use a reliable MNIST mirror (the original yann.lecun.com is often down)
+    new_mirror = "https://ossci-datasets.s3.amazonaws.com/mnist"
+    datasets.MNIST.mirrors = [new_mirror + "/"]
+
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,)),  # standard MNIST normalization
