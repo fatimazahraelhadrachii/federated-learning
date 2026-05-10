@@ -1,5 +1,5 @@
 """
-Federated Learning Client.
+Federated Learning Client (with failure injection support).
 
 Lifecycle:
   1. Register with the coordinator -> get a client_id
@@ -10,10 +10,22 @@ Lifecycle:
        d. Wait for the round to advance, then repeat
   3. Stop when the coordinator says training_complete = True
 
-Run:
+NEW: Failure injection for distributed systems testing.
+  --failure-mode {none, crash, straggler, byzantine, partition, message_loss}
+  --failure-rate 0.0-1.0   (probability per round)
+
+Examples:
+    # Normal client
     python client/client.py --client-idx 0 --num-clients 3
-    python client/client.py --client-idx 1 --num-clients 3
-    python client/client.py --client-idx 2 --num-clients 3
+
+    # Client that crashes 30% of the time
+    python client/client.py --client-idx 1 --num-clients 3 --failure-mode crash --failure-rate 0.3
+
+    # Slow client (straggler) 50% of rounds
+    python client/client.py --client-idx 2 --num-clients 3 --failure-mode straggler --failure-rate 0.5
+
+    # Byzantine attacker sending corrupted weights
+    python client/client.py --client-idx 0 --num-clients 3 --failure-mode byzantine --failure-rate 1.0
 """
 import argparse
 import logging
@@ -28,12 +40,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model.cnn import MNIST_CNN, get_model_weights, set_model_weights
 from data.partition import get_client_data
 from client.trainer import train_one_epoch, evaluate
+from client.failure_injector import FailureInjector
 
 
 # ---------- Configuration ----------
-HEARTBEAT_INTERVAL = 5     # seconds between heartbeats during idle wait
-POLL_INTERVAL = 2          # seconds between checks for round advancement
-MAX_WAIT_PER_ROUND = 120   # if we wait this long for a round to advance, give up
+HEARTBEAT_INTERVAL = 5
+POLL_INTERVAL = 2
+MAX_WAIT_PER_ROUND = 120
 
 
 def setup_logging(client_idx):
@@ -46,23 +59,39 @@ def setup_logging(client_idx):
 
 
 class FederatedClient:
-    def __init__(self, server_url, client_idx, num_clients, mode="iid"):
+    def __init__(self, server_url, client_idx, num_clients, mode="iid",
+                 failure_mode="none", failure_rate=0.0):
         self.server_url = server_url.rstrip("/")
         self.client_idx = client_idx
         self.num_clients = num_clients
-        self.client_id = None             # assigned by server
+        self.client_id = None
         self.log = setup_logging(client_idx)
 
-        # Load this client's local data shard (they don't share data!)
+        # Load this client's local data shard
         self.log.info(f"Loading local data ({mode} split, shard {client_idx}/{num_clients})...")
         self.train_data, self.test_data = get_client_data(client_idx, num_clients, mode=mode)
         self.log.info(f"Loaded {len(self.train_data)} local training samples.")
 
         self.model = MNIST_CNN()
 
-    # ---------- HTTP wrappers (with simple retry) ----------
+        # Failure injection (NEW)
+        self.failure = FailureInjector(
+            mode=failure_mode,
+            rate=failure_rate,
+            seed=42 + client_idx,  # different seed per client for realistic variety
+        )
+
+    # ---------- HTTP wrappers ----------
 
     def _post(self, path, payload, retries=3):
+        # Simulate network partition
+        if self.failure.maybe_partition():
+            self.log.warning(f"POST {path} blocked by partition.")
+            raise ConnectionError("Network partition (simulated)")
+
+        # Simulate random message drops
+        self.failure.maybe_drop_message()
+
         for attempt in range(retries):
             try:
                 r = requests.post(f"{self.server_url}{path}", json=payload, timeout=30)
@@ -73,6 +102,10 @@ class FederatedClient:
         raise ConnectionError(f"Server unreachable after {retries} attempts")
 
     def _get(self, path, retries=3):
+        if self.failure.maybe_partition():
+            self.log.warning(f"GET {path} blocked by partition.")
+            raise ConnectionError("Network partition (simulated)")
+
         for attempt in range(retries):
             try:
                 r = requests.get(f"{self.server_url}{path}", timeout=30)
@@ -91,7 +124,6 @@ class FederatedClient:
         self.log.info(f"Registered as {self.client_id} (server is on round {data['current_round']})")
 
     def fetch_global_model(self):
-        """Returns (round_number, training_complete)."""
         r = self._get("/get_model")
         data = r.json()
         set_model_weights(self.model, data["weights"])
@@ -99,6 +131,9 @@ class FederatedClient:
 
     def submit_update(self, round_num, num_samples):
         weights = get_model_weights(self.model)
+        # Apply byzantine corruption (if configured)
+        weights = self.failure.maybe_corrupt_weights(weights)
+
         payload = {
             "client_id": self.client_id,
             "round": round_num,
@@ -115,10 +150,9 @@ class FederatedClient:
         try:
             self._post("/heartbeat", {"client_id": self.client_id}, retries=1)
         except ConnectionError:
-            self.log.warning("Heartbeat failed (server may be down).")
+            self.log.warning("Heartbeat failed (server may be down or partitioned).")
 
     def wait_for_next_round(self, current_round):
-        """Poll until the server moves to a round > current_round."""
         waited = 0
         while waited < MAX_WAIT_PER_ROUND:
             time.sleep(POLL_INTERVAL)
@@ -139,35 +173,50 @@ class FederatedClient:
     # ---------- Main loop ----------
 
     def run(self):
-        self.register()
+        try:
+            self.register()
+        except ConnectionError as e:
+            self.log.error(f"Failed to register (network issue): {e}")
+            return
 
         while True:
-            round_num, done = self.fetch_global_model()
+            # Crash failure — process exits permanently
+            self.failure.maybe_crash()
+
+            try:
+                round_num, done = self.fetch_global_model()
+            except ConnectionError:
+                self.log.warning("Can't fetch model — retrying in a few seconds.")
+                time.sleep(5)
+                continue
+
             if done:
                 self.log.info("Server says training is complete.")
                 break
 
             self.log.info(f"=== Round {round_num} ===")
-
-            # Evaluate the global model on local test data BEFORE training
-            # (gives us a sense of how good the global model is)
             acc_before = evaluate(self.model, self.test_data)
             self.log.info(f"Global model accuracy on test set: {acc_before:.4f}")
 
-            # Local training
+            # Straggler — slow training
+            self.failure.maybe_straggle()
+
             self.log.info("Training locally for 1 epoch...")
             t0 = time.time()
             self.model, num_samples, avg_loss = train_one_epoch(self.model, self.train_data)
             t_train = time.time() - t0
             self.log.info(f"Trained in {t_train:.1f}s. Loss={avg_loss:.4f}")
 
-            # Submit
-            ok = self.submit_update(round_num, num_samples)
-            if not ok:
-                # Stale -> re-fetch and retry next iteration
+            try:
+                ok = self.submit_update(round_num, num_samples)
+            except ConnectionError as e:
+                self.log.warning(f"Couldn't submit update: {e}. Will retry next round.")
+                time.sleep(3)
                 continue
 
-            # Wait until the server aggregates and starts the next round
+            if not ok:
+                continue
+
             self.log.info("Waiting for other clients...")
             new_round, done = self.wait_for_next_round(round_num)
             if done:
@@ -179,12 +228,17 @@ class FederatedClient:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server-url", default="http://localhost:5050")
-    parser.add_argument("--client-idx", type=int, required=True,
-                        help="This client's index (0 to num-clients-1)")
-    parser.add_argument("--num-clients", type=int, required=True,
-                        help="Total number of clients in the federation")
+    parser.add_argument("--client-idx", type=int, required=True)
+    parser.add_argument("--num-clients", type=int, required=True)
     parser.add_argument("--mode", default="iid", choices=["iid", "non_iid"],
-                        help="How data is split across clients")
+                        help="Data distribution mode")
+    # NEW: failure injection
+    parser.add_argument("--failure-mode", default="none",
+                        choices=["none", "crash", "straggler", "byzantine",
+                                 "partition", "message_loss"],
+                        help="Type of failure to simulate")
+    parser.add_argument("--failure-rate", type=float, default=0.0,
+                        help="Probability (0-1) the failure occurs each round")
     args = parser.parse_args()
 
     client = FederatedClient(
@@ -192,6 +246,8 @@ def main():
         client_idx=args.client_idx,
         num_clients=args.num_clients,
         mode=args.mode,
+        failure_mode=args.failure_mode,
+        failure_rate=args.failure_rate,
     )
     client.run()
 
