@@ -1,0 +1,96 @@
+# docker-compose.yml — Federated Learning System
+#
+# Usage:
+#   docker-compose up --build           # build images and start everything
+#   docker-compose up                   # start (after first build)
+#   docker-compose down                 # stop and remove containers
+#   docker-compose logs -f server       # tail server logs
+#   docker-compose logs -f client_0     # tail a specific client
+#
+# Architecture:
+#   - 1 coordinator (server) on port 5050
+#   - 3 clients on a private Docker network "fl-net"
+#   - Shared MNIST volume so we don't download the dataset 3 times
+
+services:
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    image: fl-server:latest
+    container_name: fl-server
+    networks:
+      - fl-net
+    ports:
+      # host:container — lets you visit http://localhost:5050/status from your Mac
+      - "5050:5050"
+    healthcheck:
+      # The coordinator exposes /status; we use it as a readiness signal for clients
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5050/status', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  client_0:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    image: fl-client:latest
+    container_name: fl-client-0
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fl-net
+    volumes:
+      # Shared MNIST cache — first client to start downloads, others reuse
+      - mnist_data:/app/mnist_data
+    command: >
+      --server-url http://server:5050
+      --client-idx 0
+      --num-clients 3
+      --mode iid
+
+  client_1:
+    image: fl-client:latest
+    container_name: fl-client-1
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fl-net
+    volumes:
+      - mnist_data:/app/mnist_data
+    command: >
+      --server-url http://server:5050
+      --client-idx 1
+      --num-clients 3
+      --mode iid
+
+  client_2:
+    image: fl-client:latest
+    container_name: fl-client-2
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fl-net
+    volumes:
+      - mnist_data:/app/mnist_data
+    command: >
+      --server-url http://server:5050
+      --client-idx 2
+      --num-clients 3
+      --mode iid
+
+# Custom network so the containers can find each other by name
+# (e.g. "server" resolves to the coordinator's container IP)
+networks:
+  fl-net:
+    driver: bridge
+
+# Persistent volume for the MNIST cache — survives container restarts
+volumes:
+  mnist_data:

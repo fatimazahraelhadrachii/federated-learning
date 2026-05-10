@@ -1,0 +1,95 @@
+# Docker Quickstart
+
+This project is fully containerized. You can run the entire federated learning
+system with one command — no local Python setup needed.
+
+## Prerequisites
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
+- ~2GB of free disk space (for images + dataset)
+
+## Quickstart — Normal Run
+
+```bash
+# Build images and start server + 3 clients
+docker-compose up --build
+
+# Or, after the first build, just:
+docker-compose up
+```
+
+You'll see logs from all 4 services interleaved (color-coded).
+
+To stop:
+
+```bash
+# Press Ctrl+C in the docker-compose terminal, then:
+docker-compose down
+```
+
+## Failure Simulation Run
+
+To demonstrate the system's robustness with failing clients:
+
+```bash
+docker-compose -f docker-compose.failures.yml up --build
+```
+
+This starts:
+- 1 normal client
+- 1 straggler client (random slow training)
+- 1 crashy client (random permanent failures)
+
+The system should still complete training despite these failures.
+
+## Useful Commands
+
+```bash
+# Check server status from your host machine
+curl http://localhost:5050/status | python -m json.tool
+
+# Watch logs of a specific service
+docker-compose logs -f server
+docker-compose logs -f client_0
+
+# Run a custom client with failure injection
+docker-compose run --rm client_0 \
+  --server-url http://server:5050 \
+  --client-idx 0 \
+  --num-clients 3 \
+  --failure-mode byzantine \
+  --failure-rate 1.0
+
+# Clean up everything (containers + images + volumes)
+docker-compose down -v
+docker rmi fl-server:latest fl-client:latest
+```
+
+## Scaling to More Clients
+
+Edit `docker-compose.yml` and add more `client_N` blocks, or use:
+
+```bash
+docker-compose up --scale client_0=5
+```
+
+## Troubleshooting
+
+**Port 5050 already in use:**
+```bash
+# Find what's using it
+lsof -i :5050
+# Or change the port in docker-compose.yml: "5051:5050"
+```
+
+**MNIST download fails inside the container:**
+The `mnist_data` volume is shared, so only the first client downloads it.
+If it fails, delete the volume and retry:
+```bash
+docker-compose down -v && docker-compose up --build
+```
+
+**"No space left on device":**
+```bash
+docker system prune -a   # cleans up unused images
+```

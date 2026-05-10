@@ -1,0 +1,31 @@
+# Don't ship the local Python virtualenv
+venv/
+.venv/
+
+# Don't ship Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Don't ship the MNIST dataset (we'll mount it as a volume instead)
+mnist_data/
+
+# Don't ship git history
+.git/
+.gitignore
+
+# IDE / OS junk
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and screenshots from the report
+report/
+*.log
+logs/
+
+# Docker files themselves
+Dockerfile.*
+docker-compose.yml
+.dockerignore

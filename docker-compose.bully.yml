@@ -1,0 +1,145 @@
+# docker-compose.bully.yml — 3 coordinators with Bully election + 3 clients
+#
+# Demonstrates leader election:
+#   docker-compose -f docker-compose.bully.yml up --build
+#
+# To kill the leader and watch a new one take over:
+#   docker stop fl-coord-2     # kill coordinator with highest ID (the leader)
+# Watch the logs of coord-0 and coord-1 — they detect the dead leader and
+# coord-1 (next-highest ID) becomes the new leader within ~10 seconds.
+#
+# To bring it back:
+#   docker start fl-coord-2
+# coord-2 has the highest ID, so it "bullies" its way back to leader.
+
+services:
+
+  coordinator_0:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    image: fl-server:latest
+    container_name: fl-coord-0
+    networks:
+      - fl-bully-net
+    ports:
+      - "5050:5050"
+    environment:
+      COORD_ID: "0"
+      COORD_PORT: "5050"
+      COORD_PEERS: "0=http://coordinator_0:5050,1=http://coordinator_1:5051,2=http://coordinator_2:5052"
+      MAX_ROUNDS: "10"
+      MIN_CLIENTS_PER_ROUND: "2"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5050/bully/whoisleader', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  coordinator_1:
+    image: fl-server:latest
+    container_name: fl-coord-1
+    networks:
+      - fl-bully-net
+    ports:
+      - "5051:5051"
+    environment:
+      COORD_ID: "1"
+      COORD_PORT: "5051"
+      COORD_PEERS: "0=http://coordinator_0:5050,1=http://coordinator_1:5051,2=http://coordinator_2:5052"
+      MAX_ROUNDS: "10"
+      MIN_CLIENTS_PER_ROUND: "2"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5051/bully/whoisleader', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  coordinator_2:
+    image: fl-server:latest
+    container_name: fl-coord-2
+    networks:
+      - fl-bully-net
+    ports:
+      - "5052:5052"
+    environment:
+      COORD_ID: "2"
+      COORD_PORT: "5052"
+      COORD_PEERS: "0=http://coordinator_0:5050,1=http://coordinator_1:5051,2=http://coordinator_2:5052"
+      MAX_ROUNDS: "10"
+      MIN_CLIENTS_PER_ROUND: "2"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5052/bully/whoisleader', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  client_0:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    image: fl-client:latest
+    container_name: fl-bully-client-0
+    depends_on:
+      coordinator_0:
+        condition: service_healthy
+      coordinator_1:
+        condition: service_healthy
+      coordinator_2:
+        condition: service_healthy
+    networks:
+      - fl-bully-net
+    volumes:
+      - mnist_data_bully:/app/mnist_data
+    command: >
+      --coordinator-urls http://coordinator_0:5050,http://coordinator_1:5051,http://coordinator_2:5052
+      --client-idx 0
+      --num-clients 3
+      --mode iid
+
+  client_1:
+    image: fl-client:latest
+    container_name: fl-bully-client-1
+    depends_on:
+      coordinator_0:
+        condition: service_healthy
+      coordinator_1:
+        condition: service_healthy
+      coordinator_2:
+        condition: service_healthy
+    networks:
+      - fl-bully-net
+    volumes:
+      - mnist_data_bully:/app/mnist_data
+    command: >
+      --coordinator-urls http://coordinator_0:5050,http://coordinator_1:5051,http://coordinator_2:5052
+      --client-idx 1
+      --num-clients 3
+      --mode iid
+
+  client_2:
+    image: fl-client:latest
+    container_name: fl-bully-client-2
+    depends_on:
+      coordinator_0:
+        condition: service_healthy
+      coordinator_1:
+        condition: service_healthy
+      coordinator_2:
+        condition: service_healthy
+    networks:
+      - fl-bully-net
+    volumes:
+      - mnist_data_bully:/app/mnist_data
+    command: >
+      --coordinator-urls http://coordinator_0:5050,http://coordinator_1:5051,http://coordinator_2:5052
+      --client-idx 2
+      --num-clients 3
+      --mode iid
+
+networks:
+  fl-bully-net:
+    driver: bridge
+
+volumes:
+  mnist_data_bully:

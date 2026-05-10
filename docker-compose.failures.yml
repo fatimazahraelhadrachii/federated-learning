@@ -1,0 +1,94 @@
+# docker-compose.failures.yml — Federated Learning with Failure Injection
+#
+# Demonstrates the system's robustness with failing clients in containers.
+# Three scenarios run together:
+#   - client_0: normal
+#   - client_1: straggler (slow, 50% of rounds)
+#   - client_2: crash (50% chance per round)
+#
+# Usage:
+#   docker-compose -f docker-compose.failures.yml up --build
+#
+# This is GOLD for the report's "résultats des tests de robustesse" section —
+# you can show the system surviving all these failures simultaneously.
+
+services:
+
+  server:
+    image: fl-server:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: fl-server-fail
+    networks:
+      - fl-net-fail
+    ports:
+      - "5050:5050"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5050/status', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  client_0_normal:
+    image: fl-client:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: fl-client-normal
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fl-net-fail
+    volumes:
+      - mnist_data_fail:/app/mnist_data
+    command: >
+      --server-url http://server:5050
+      --client-idx 0
+      --num-clients 3
+      --mode iid
+
+  client_1_straggler:
+    image: fl-client:latest
+    container_name: fl-client-straggler
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fl-net-fail
+    volumes:
+      - mnist_data_fail:/app/mnist_data
+    command: >
+      --server-url http://server:5050
+      --client-idx 1
+      --num-clients 3
+      --mode iid
+      --failure-mode straggler
+      --failure-rate 0.5
+
+  client_2_crashy:
+    image: fl-client:latest
+    container_name: fl-client-crashy
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - fl-net-fail
+    volumes:
+      - mnist_data_fail:/app/mnist_data
+    command: >
+      --server-url http://server:5050
+      --client-idx 2
+      --num-clients 3
+      --mode iid
+      --failure-mode crash
+      --failure-rate 0.5
+    restart: "no"  # crucial: don't restart a "crashed" client
+
+networks:
+  fl-net-fail:
+    driver: bridge
+
+volumes:
+  mnist_data_fail:

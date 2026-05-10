@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install lightweight CPU-only PyTorch FIRST
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.2.0 torchvision==0.17.0
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY model/ ./model/
+COPY client/ ./client/
+COPY data/ ./data/
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "client/client.py"]

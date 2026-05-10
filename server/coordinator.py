@@ -1,22 +1,30 @@
 """
-Coordinator Server — orchestrates federated learning rounds.
+Coordinator Server (v3) — with Bully leader election.
 
-Responsibilities:
-  1. Hold the global model
-  2. Accept client registrations
-  3. Serve the current global model to clients on request
-  4. Receive trained weights from clients
-  5. Once enough clients have submitted, run FedAvg and start a new round
-  6. Track client liveness via heartbeats
+The system runs N coordinator processes. Only the LEADER processes client
+requests; followers reject them with the leader's URL. If the leader dies,
+the surviving coordinators automatically elect a new one (Bully algorithm).
 
-REST API:
-  POST /register        -> client announces itself, gets a client_id
-  GET  /get_model       -> returns current global weights + round number
-  POST /submit_update   -> client submits its trained weights for the round
-  POST /heartbeat       -> client signals it's still alive
-  GET  /status          -> debug endpoint, returns server state
+Configuration via environment variables:
+    COORD_ID        — this coordinator's unique ID (e.g. 0, 1, 2)
+    COORD_PORT      — port to listen on (e.g. 5050)
+    COORD_PEERS     — comma-separated "id=url" pairs for ALL coordinators
+                      e.g. "0=http://coordinator-0:5050,1=http://coordinator-1:5051,2=http://coordinator-2:5052"
+
+REST API (existing FL endpoints work only on the leader):
+  POST /register
+  GET  /get_model
+  POST /submit_update
+  POST /heartbeat
+  GET  /status
+
+NEW endpoints (always served, by leader and followers):
+  POST /bully/election       — peer is starting an election
+  POST /bully/coordinator    — peer is announcing itself as leader
+  GET  /bully/whoisleader    — debug: ask any node who's leader
 """
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -25,44 +33,57 @@ from datetime import datetime
 from flask import Flask, jsonify, request
 
 import sys
-import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.cnn import MNIST_CNN, get_model_weights, set_model_weights
+from model.lamport_clock import LamportClock
 from server.aggregator import federated_average
+from server.bully import BullyElection
 
 
 # ---------- Configuration ----------
 HOST = "0.0.0.0"
-PORT = 5050
-MIN_CLIENTS_PER_ROUND = 2     # how many clients must submit before we aggregate
-MAX_ROUNDS = 10               # total federated rounds before we stop
-HEARTBEAT_TIMEOUT = 30        # seconds before a client is considered dead
+PORT = int(os.environ.get("COORD_PORT", "5050"))
+COORD_ID = int(os.environ.get("COORD_ID", "0"))
+
+# Parse peer list. Format: "0=http://host:port,1=http://host:port,..."
+_peer_str = os.environ.get("COORD_PEERS", f"{COORD_ID}=http://localhost:{PORT}")
+PEER_URLS = {}
+for entry in _peer_str.split(","):
+    entry = entry.strip()
+    if not entry:
+        continue
+    pid, url = entry.split("=", 1)
+    PEER_URLS[int(pid)] = url
+
+MY_URL = PEER_URLS.get(COORD_ID, f"http://localhost:{PORT}")
+
+MIN_CLIENTS_PER_ROUND = int(os.environ.get("MIN_CLIENTS_PER_ROUND", "2"))
+MAX_ROUNDS = int(os.environ.get("MAX_ROUNDS", "10"))
+HEARTBEAT_TIMEOUT = 30
 
 # ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [SERVER] %(levelname)s: %(message)s",
+    format=f"%(asctime)s [COORD-{COORD_ID}] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-# silence Flask's noisy default request logging
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
-# ---------- Server state (in-memory, protected by a lock) ----------
+# ---------- Server state ----------
 class ServerState:
-    """All mutable state lives here, behind a single lock for thread-safety."""
-
     def __init__(self):
         self.lock = threading.Lock()
         self.global_model = MNIST_CNN()
         self.current_round = 0
-        self.clients = {}                  # client_id -> {"last_seen": timestamp, "address": str}
-        self.round_updates = defaultdict(list)  # round -> list of {weights, num_samples, client_id}
+        self.clients = {}
+        self.round_updates = defaultdict(list)
         self.next_client_id = 0
         self.training_complete = False
-        self.round_history = []            # for the report: track timing, num clients, etc.
+        self.round_history = []
+        self.clock = LamportClock(f"coord_{COORD_ID}")
 
     def register_client(self, address):
         cid = f"client_{self.next_client_id}"
@@ -81,105 +102,184 @@ class ServerState:
 
 
 state = ServerState()
+bully = BullyElection(my_id=COORD_ID, my_url=MY_URL, peer_urls=PEER_URLS)
 app = Flask(__name__)
 
 
-# ---------- Endpoints ----------
+# ---------- Leader-only guard ----------
+
+def _require_leader():
+    """
+    Returns None if we ARE the leader, or a JSON response redirecting
+    to the actual leader if we are not.
+    """
+    if bully.is_leader():
+        return None
+    leader_id = bully.get_leader_id()
+    leader_url = PEER_URLS.get(leader_id) if leader_id is not None else None
+    return jsonify({
+        "status": "not_leader",
+        "leader_id": leader_id,
+        "leader_url": leader_url,
+        "this_coordinator": COORD_ID,
+    }), 421  # 421 Misdirected Request
+
+
+# ---------- Bully endpoints (always served) ----------
+
+@app.route("/bully/election", methods=["POST"])
+def bully_election():
+    payload = request.get_json()
+    return jsonify(bully.handle_election_message(payload["from_id"]))
+
+
+@app.route("/bully/coordinator", methods=["POST"])
+def bully_coordinator():
+    payload = request.get_json()
+    return jsonify(bully.handle_coordinator_message(
+        payload["leader_id"], payload["leader_url"]
+    ))
+
+
+@app.route("/bully/whoisleader", methods=["GET"])
+def bully_whoisleader():
+    return jsonify({
+        "leader_id": bully.get_leader_id(),
+        "leader_url": PEER_URLS.get(bully.get_leader_id()) if bully.get_leader_id() is not None else None,
+        "this_coordinator": COORD_ID,
+        "this_role": bully.role.value,
+    })
+
+
+# ---------- FL endpoints (leader-only) ----------
 
 @app.route("/register", methods=["POST"])
 def register():
-    """A client announces itself. Returns its assigned client_id."""
+    redirect = _require_leader()
+    if redirect is not None:
+        return redirect
+
     address = request.remote_addr
+    payload = request.get_json(silent=True) or {}
+    client_clock = payload.get("clock", 0)
+
     with state.lock:
+        new_clock = state.clock.receive_event(client_clock)
         cid = state.register_client(address)
-    log.info(f"Registered {cid} from {address}")
-    return jsonify({"client_id": cid, "current_round": state.current_round})
+
+    log.info(f"[L={new_clock}] Registered {cid} from {address}")
+    return jsonify({
+        "client_id": cid,
+        "current_round": state.current_round,
+        "clock": new_clock,
+    })
 
 
 @app.route("/get_model", methods=["GET"])
 def get_model():
-    """Returns the current global model weights + round number."""
+    redirect = _require_leader()
+    if redirect is not None:
+        return redirect
+
+    client_clock = int(request.args.get("clock", 0))
     with state.lock:
+        new_clock = state.clock.receive_event(client_clock)
         weights = get_model_weights(state.global_model)
         return jsonify({
             "round": state.current_round,
             "weights": weights,
             "training_complete": state.training_complete,
+            "clock": new_clock,
         })
 
 
 @app.route("/submit_update", methods=["POST"])
 def submit_update():
-    """
-    A client submits its locally-trained weights.
-    When enough updates arrive for the current round, we aggregate.
-    """
+    redirect = _require_leader()
+    if redirect is not None:
+        return redirect
+
     payload = request.get_json()
     client_id = payload["client_id"]
     submitted_round = payload["round"]
     weights = payload["weights"]
     num_samples = payload["num_samples"]
+    client_clock = payload.get("clock", 0)
 
     with state.lock:
-        # Reject stale updates from a previous round (a slow client we already moved past)
+        new_clock = state.clock.receive_event(client_clock)
+
         if submitted_round != state.current_round:
             log.warning(
-                f"{client_id} submitted for round {submitted_round} "
+                f"[L={new_clock}] {client_id} submitted for round {submitted_round} "
                 f"but we're on round {state.current_round} — dropping."
             )
-            return jsonify({"status": "stale", "current_round": state.current_round}), 409
+            return jsonify({
+                "status": "stale",
+                "current_round": state.current_round,
+                "clock": new_clock,
+            }), 409
 
         state.update_heartbeat(client_id)
         state.round_updates[submitted_round].append({
             "client_id": client_id,
             "weights": weights,
             "num_samples": num_samples,
+            "client_clock": client_clock,
         })
         num_received = len(state.round_updates[submitted_round])
         log.info(
-            f"Round {submitted_round}: received update from {client_id} "
-            f"({num_samples} samples). Total this round: {num_received}/{MIN_CLIENTS_PER_ROUND}"
+            f"[L={new_clock}] Round {submitted_round}: received update from {client_id} "
+            f"({num_samples} samples). Total: {num_received}/{MIN_CLIENTS_PER_ROUND}"
         )
 
-        # If we have enough updates, aggregate and advance the round
         if num_received >= MIN_CLIENTS_PER_ROUND:
             _aggregate_and_advance()
 
-    return jsonify({"status": "accepted", "round": submitted_round})
+    return jsonify({"status": "accepted", "round": submitted_round, "clock": state.clock.value})
 
 
 @app.route("/heartbeat", methods=["POST"])
 def heartbeat():
-    """Client signals it's still alive."""
+    redirect = _require_leader()
+    if redirect is not None:
+        return redirect
+
     payload = request.get_json()
     client_id = payload.get("client_id")
+    client_clock = payload.get("clock", 0)
     with state.lock:
+        new_clock = state.clock.receive_event(client_clock)
         state.update_heartbeat(client_id)
-    return jsonify({"status": "ok", "current_round": state.current_round})
+    return jsonify({"status": "ok", "current_round": state.current_round, "clock": new_clock})
 
 
 @app.route("/status", methods=["GET"])
 def status():
-    """Debug endpoint — see what the server is doing."""
     with state.lock:
         return jsonify({
+            "coordinator_id": COORD_ID,
+            "role": bully.role.value,
+            "is_leader": bully.is_leader(),
+            "leader_id": bully.get_leader_id(),
             "current_round": state.current_round,
             "training_complete": state.training_complete,
             "registered_clients": list(state.clients.keys()),
             "alive_clients": state.alive_clients(),
             "updates_this_round": len(state.round_updates[state.current_round]),
             "round_history": state.round_history,
+            "lamport_clock": state.clock.value,
         })
 
 
 # ---------- Aggregation ----------
 
 def _aggregate_and_advance():
-    """Called while holding state.lock. Runs FedAvg and starts the next round."""
     round_num = state.current_round
     updates = state.round_updates[round_num]
 
-    log.info(f"--- Aggregating round {round_num} with {len(updates)} client updates ---")
+    state.clock.tick()
+    log.info(f"[L={state.clock.value}] --- Aggregating round {round_num} with {len(updates)} updates ---")
     start = time.time()
 
     new_weights = federated_average(updates)
@@ -190,39 +290,48 @@ def _aggregate_and_advance():
         "round": round_num,
         "num_clients": len(updates),
         "client_ids": [u["client_id"] for u in updates],
+        "client_clocks": [u["client_clock"] for u in updates],
+        "server_clock_at_aggregation": state.clock.value,
         "aggregation_time_sec": round(elapsed, 3),
         "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "leader_coordinator_id": COORD_ID,
     })
-    log.info(f"Round {round_num} complete in {elapsed:.2f}s. Advancing to round {round_num + 1}.")
+    log.info(f"[L={state.clock.value}] Round {round_num} complete in {elapsed:.2f}s. -> round {round_num + 1}.")
 
     state.current_round += 1
     if state.current_round >= MAX_ROUNDS:
         state.training_complete = True
-        log.info(f"🎉 Training complete after {MAX_ROUNDS} rounds!")
+        log.info(f"[L={state.clock.value}] 🎉 Training complete after {MAX_ROUNDS} rounds!")
 
 
-# ---------- Background reaper for dead clients ----------
+# ---------- Background reaper ----------
 
 def _reap_dead_clients():
-    """Logs clients that haven't sent heartbeats — useful for failure detection."""
     while True:
         time.sleep(10)
+        if not bully.is_leader():
+            continue  # only the leader tracks clients
         with state.lock:
             now = time.time()
             dead = [cid for cid, info in state.clients.items()
                     if now - info["last_seen"] > HEARTBEAT_TIMEOUT]
             if dead:
-                log.warning(f"💀 Clients with no recent heartbeat: {dead}")
+                log.warning(f"[L={state.clock.value}] 💀 Clients silent: {dead}")
 
 
 # ---------- Entry point ----------
 
 if __name__ == "__main__":
-    log.info(f"Starting coordinator on {HOST}:{PORT}")
-    log.info(f"Config: MIN_CLIENTS_PER_ROUND={MIN_CLIENTS_PER_ROUND}, MAX_ROUNDS={MAX_ROUNDS}")
+    log.info(f"=" * 60)
+    log.info(f"Starting coordinator {COORD_ID} on {HOST}:{PORT}")
+    log.info(f"My URL: {MY_URL}")
+    log.info(f"Peers: {PEER_URLS}")
+    log.info(f"=" * 60)
 
-    reaper = threading.Thread(target=_reap_dead_clients, daemon=True)
-    reaper.start()
+    # Start the bully election monitor
+    bully.start_background_thread()
 
-    # threaded=True so multiple clients can hit the server in parallel
+    # Start the dead-client reaper (only does work if we're leader)
+    threading.Thread(target=_reap_dead_clients, daemon=True).start()
+
     app.run(host=HOST, port=PORT, threaded=True, debug=False)
